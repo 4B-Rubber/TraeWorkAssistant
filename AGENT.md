@@ -98,7 +98,7 @@ ai-work-assistant/
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
-| 环境 | `env_check` → `EnvStatus` | `installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿） |
+| 环境 | `env_check` → `EnvStatus` | `installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿）。**提速修订（2026-10-07）**：版本号改 `pe_version` 直读 PE 版本资源（原 powershell 子进程 1.2s+/次 → 1.9ms，按 mtime 缓存命中 0.14ms），运行态改 `switcher::proc::any_running` 进程表枚举 + 2s TTL（原 tasklist 261ms/次 → 18ms），`app_locate` 注册表/进程兜底两级加 3s TTL——同一轮界面切换里概览页与顶栏重复探测不再重复掏子进程 |
 | 环境 | `open_trae_website()` / `open_trae_app()` | 打开 Trae 官网 / 启动 Trae Work（代理注入时优雅关闭进程最长 5s，async） |
 | 环境 | `env_check_trae_cn()` / `open_trae_cn_app()` | Trae CN IDE 环境检测 / 启动（双应用支持） |
 | 证书 | `cert_status` / `cert_install` | 安装走 UAC `certutil -addstore -f Root` |
@@ -175,7 +175,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，主 exe `--task-run wb-renew` → `run_renew_only` 惰性刷新） |
-| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B） |
+| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B）。**提速修订（2026-10-08）**：账号间并发取数（≤4 路；原串行 for 让「N 账号 × ≥3 次请求」在全局代理/跨境出口下线性放大，实测单请求 0.1s→2s+ 直接反映为切板块等待）+ 缓存过期时 **stale-while-revalidate**：非 `fresh` 调用先回旧值（`cached:true, refreshing:true`）并把刷新转后台线程（进程内在途去重），前端 `BuddyOverview` 按 `refreshing` 最多重取 4 次拿新值；`fresh=true`（手动刷新）与「无缓存」仍同步拉 |
 | WorkBuddy | `workbuddy_credits_history_list()` | WB 每日积分快照时序读取（wb_credits_history 表，365 天，含 earned；看板「Buddy 获得积分」方案 B 数据源） |
 | WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
 | WorkBuddy | `workbuddy_cli_status / _bridge_set(userId) / _rotate_run / _rotate_logs(limit?)` | CLI 切号桥（F-06/F-59，批次3）：桥接状态（含 environment_override 警告）/ 写 `~/.codebuddy/settings.json` env 直桥 / 手动触发五重防护轮换 / 轮换日志（cap 50）；后台轮换线程 `start_cli_rotate_thread()` 按 settings.cli_* 配置独立运行（`workbuddy_cli.rs` 决策纯函数 `decide_target` 13 单测） |
@@ -439,6 +439,8 @@ ai-work-assistant/
 
 - 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
 - **PowerShell 运行时依赖已移除**：切换/保存/备份/恢复/保活全链路由 `switcher` 模块进程内直调（仅 Windows，sysinfo 0.33 锁定版——0.38+ 需 rustc 1.88 超出项目 MSRV 1.85）。
+- **环境检测零子进程（2026-10-07）**：版本号直读 PE 版本资源（`pe_version.rs`，按 mtime+size 缓存，读不到才回退 powershell）、运行态走 `switcher::proc::any_running`（sysinfo 快照 + 2s TTL）、`app_locate` 兜底两级（注册表/进程）带 3s TTL——切换板块时概览页与顶栏会重复探测，缓存即为此设计。**注意：关闭/强杀轮询（`commands/process.rs`、`switcher::proc::list_procs`）需实时快照，勿接入上述缓存。**
+- **Buddy 积分 SWR 语义（2026-10-08）**：`workbuddy_credits_fetch` 在非 `fresh` 且缓存过期时返回旧值 + `refreshing:true`，刷新转入后台线程（同刻仅一轮，日志 `[wb-credits] 后台刷新完成…`）；`stale:true` 仍**专指** F-59「刷新失败回退」，两者勿混用；前端按 `refreshing` 决定是否重取（`BuddyOverview`）。
 - `profiles_dir` 路径为 `data_dir.join("data").join("profiles")`，注意 `data/` 子目录。
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。
 - 日志文件首行可能有 BOM 前缀（PowerShell 5.1 `-Encoding UTF8`），`split_time` 已处理。
