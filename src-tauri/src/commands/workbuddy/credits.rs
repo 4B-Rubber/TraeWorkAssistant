@@ -60,6 +60,15 @@ fn spawn_background_refresh(state: &State<AppState>) {
     }
     let st = state.inner().clone();
     std::thread::spawn(move || {
+        // 复位兜底（2026-10-08 评审）：线程 panic 时 Drop 守卫仍复位 IN_FLIGHT，
+        // 否则原子标记永久卡 true、后台刷新静默失效（SWR 恒回旧值）
+        struct ResetInFlight;
+        impl Drop for ResetInFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetInFlight;
         let started = std::time::Instant::now();
         match credits_refresh_now(&st, None, true) {
             Ok(_) => fs_utils::app_log(
@@ -77,7 +86,6 @@ fn spawn_background_refresh(state: &State<AppState>) {
                 ),
             ),
         }
-        IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
 

@@ -530,7 +530,7 @@ fn filter_accounts(v: Value, uid: &str, key: &str) -> Value {
 }
 
 /// 并行执行（≤workers 并发），结果与逐项耗时按**原序**回填；抽成泛型便于单测锁定
-/// 「保序 + 确实并发」两条契约（槽位缺失 = 该线程 panic，返回 None 由调用方占位保序）。
+/// 「保序 + 确实并发」两条契约（f panic 就地捕获 → 槽位缺失返回 None，由调用方占位保序）。
 fn parallel_ordered<T, R, F>(items: &[T], workers: usize, f: F) -> (Vec<Option<R>>, Vec<u128>)
 where
     T: Sync,
@@ -552,10 +552,15 @@ where
                     break;
                 }
                 let t0 = std::time::Instant::now();
-                let out = f(&items[i]);
+                // panic 占位落实（2026-10-08 评审）：thread::scope 会向调用方传播未捕获
+                // panic（令整轮取数 Err），此处就地捕获——单账号异常只占位失败行，
+                // 对齐「单账号失败不拖垮整轮」语义
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[i])));
                 let ms = t0.elapsed().as_millis();
-                if let Ok(mut guard) = slots.lock() {
-                    guard[i] = Some((out, ms));
+                if let Ok(out) = out {
+                    if let Ok(mut guard) = slots.lock() {
+                        guard[i] = Some((out, ms));
+                    }
                 }
             });
         }
@@ -820,6 +825,23 @@ mod wb_credits_tests {
             max_live.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "应观察到并发执行（≥2 路同时在跑）"
         );
+    }
+
+    #[test]
+    fn 并发取数panic占位不传播() {
+        // 2026-10-08 评审：f panic 必须就地捕获占位 None——thread::scope 会传播未捕获
+        // panic，若不捕获则单账号异常令整轮取数 Err（占位语义回归锁定）
+        let items: Vec<u32> = vec![1, 2, 3];
+        let (out, durations) = parallel_ordered(&items, 2, |x| {
+            if *x == 2 {
+                panic!("模拟单账号取数异常");
+            }
+            x * 10
+        });
+        assert_eq!(out[0], Some(10));
+        assert!(out[1].is_none(), "panic 项应占位 None");
+        assert_eq!(out[2], Some(30));
+        assert_eq!(durations[1], 0, "panic 项耗时占位 0");
     }
 
     #[test]
