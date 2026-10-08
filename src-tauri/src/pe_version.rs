@@ -42,7 +42,7 @@ mod win {
     }
 
     /// 载入版本资源原始字节块；文件无版本资源 / 读取失败返回 None
-    fn version_block(path: &str) -> Option<Vec<u8>> {
+    pub(super) fn version_block(path: &str) -> Option<Vec<u8>> {
         let path_w = wide(path);
         let mut handle: u32 = 0;
         // SAFETY: path_w 为以 NUL 结尾的合法宽字符串；handle 为可写出参
@@ -112,8 +112,12 @@ mod win {
         }
     }
 
-    /// StringFileInfo 的语言/代码页组合（`\VarFileInfo\Translation`，每项 4 字节：
-    /// 高 16 位语言 ID + 低 16 位代码页）；缺失时回退 en-US + Unicode（PowerShell 同款兜底）
+    /// StringFileInfo 的语言/代码页组合（`\VarFileInfo\Translation`，每项 4 字节 =
+    /// `{ WORD wLanguage; WORD wCodePage }`，小端内存序 → `u32::from_le_bytes` 读出后
+    /// **低 16 位是语言 ID、高 16 位是代码页**）；缺失时回退 en-US + Unicode
+    ///（PowerShell 同款兜底，常量按同序 = (代码页 << 16) | 语言 ID）。
+    /// 评审修正（2026-10-08）：原实现高低位颠倒，对真实资源必然 miss 子块名 → 静默
+    /// 落到 VS_FIXEDFILEINFO，Electron 系客户端版本显示退化为构建号（PR #68 评审实测）。
     fn translations(block: &[u8]) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         if let Some((off, len)) = query_offset(block, "\\VarFileInfo\\Translation") {
@@ -123,15 +127,16 @@ mod win {
             }
         }
         if out.is_empty() {
-            out.push(0x0409_04B0);
+            out.push(0x04B0_0409); // en-US(0x0409) + Unicode(0x04B0)
         }
         out
     }
 
-    /// 按语言/代码页逐个尝试取 StringFileInfo 值（多语言资源命中即返回）
-    fn string_file_info(block: &[u8], key: &str) -> Option<String> {
+    /// 按语言/代码页逐个尝试取 StringFileInfo 值（多语言资源命中即返回）。
+    /// 子块名语言 ID 在前：`\StringFileInfo\{lang:04x}{cp:04x}\{key}`
+    pub(super) fn string_file_info(block: &[u8], key: &str) -> Option<String> {
         for t in translations(block) {
-            let sub = format!("\\StringFileInfo\\{:04x}{:04x}\\{}", t >> 16, t & 0xFFFF, key);
+            let sub = format!("\\StringFileInfo\\{:04x}{:04x}\\{}", t & 0xFFFF, t >> 16, key);
             if let Some(v) = query_string(block, &sub) {
                 return Some(v);
             }
@@ -193,6 +198,14 @@ mod tests {
         }
         let v = product_or_file_version(&exe.to_string_lossy());
         assert!(v.is_some(), "notepad.exe 应能读到版本串: {v:?}");
+        // 回归锁定（2026-10-08 评审）：Translation 低 16 位才是语言 ID——若字节序颠倒，
+        // 字符串表全 miss、静默落到 VS_FIXEDFILEINFO。notepad 两者恰好相等，
+        // product_or_file_version 察觉不到，必须直查字符串表
+        let block = win::version_block(&exe.to_string_lossy()).expect("notepad 版本资源块");
+        assert!(
+            win::string_file_info(&block, "ProductVersion").is_some(),
+            "StringFileInfo\\{{lang}}{{cp}}\\ProductVersion 应命中（Translation 字节序回归）"
+        );
         let v = v.unwrap();
         assert!(
             v.chars().next().is_some_and(|c| c.is_ascii_digit()),
