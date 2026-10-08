@@ -3,9 +3,7 @@
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
 use sha2::{Digest, Sha256};
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use tauri::{AppHandle, State};
 
 use crate::fs_utils;
@@ -246,11 +244,9 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
 }
 
 pub(super) fn is_running() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq WorkBuddy.exe", "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("WorkBuddy.exe"))
+    // 原 tasklist 子进程（单次实测 ~260ms）改为 sysinfo 进程表枚举 + 短 TTL 复用
+    // （见 switcher::proc::any_running）；概览页与顶栏同轮切换会各问一次
+    crate::switcher::proc::any_running(&["WorkBuddy"])
 }
 
 // 宽容字段提取统一走 fs_utils::dig（含 data/result/resp/response/info/auth/account
