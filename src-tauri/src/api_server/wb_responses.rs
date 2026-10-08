@@ -124,14 +124,18 @@ pub fn responses_to_chat(body: &Value) -> Result<Value, String> {
 /// - 连续 `function_call` 合并进同一条 assistant 消息（tool_calls 累加）；
 /// - 配对窗口内（有调用未回填结果）到达的非 tool 消息推迟到该批结果之后按序补回；
 ///   窗口内的 assistant 文本并入 tool_calls 载体（属于同一轮 assistant 输出）
-/// - 收尾先给无结果的调用补占位 tool 结果（必须紧跟 assistant），再补推迟消息
-///   （顺序不可换，否则占位结果又被推迟消息隔开、复现 11148）；
-///   孤儿/重复 `function_call_output`（无对应未回填调用）直接丢弃
+/// - 工具结果先入缓冲，窗口关闭/收尾时按载体 tool_calls 顺序统一回填（与到达序
+///   无关，消除严格按位置校验上游的残余风险），无结果的调用补占位；
+/// - 回填结果必须紧跟 assistant，其后才补被推迟的消息（顺序不可换，否则占位结果
+///   又被推迟消息隔开、复现 11148）；孤儿/重复 `function_call_output`（无对应
+///   未回填调用）直接丢弃
 fn convert_input_items(items: &[Value]) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     // 已发出但尚未收到结果的 tool_call_id：非空即处于「工具结果必须连续」窗口。
     // 不变量：pending 非空 ⟺ open_assistant 为 Some
     let mut pending_calls: Vec<String> = Vec::new();
+    // 窗口内已收到的工具结果 (call_id, text)，窗口关闭/收尾时按 tool_calls 顺序回填
+    let mut results: Vec<(String, String)> = Vec::new();
     // 配对窗口内被推迟的非 tool 消息（role 已降级：developer→user，system 保留）
     let mut deferred: Vec<(String, String)> = Vec::new();
     // 缺 call_id 时的兜底自增序号
@@ -166,16 +170,14 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                         messages.len() - 1
                     }
                 };
-                if let Some(arr) = messages[idx]
-                    .get_mut("tool_calls")
-                    .and_then(|t| t.as_array_mut())
-                {
-                    arr.push(json!({
+                messages[idx]["tool_calls"]
+                    .as_array_mut()
+                    .expect("carrier always carries a tool_calls array")
+                    .push(json!({
                         "id": call_id,
                         "type": "function",
                         "function": {"name": name, "arguments": args},
                     }));
-                }
                 open_assistant = Some(idx);
                 pending_calls.push(call_id);
             }
@@ -193,10 +195,12 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                 };
                 let call_id = call_id.to_string();
                 let output = tool_output_text(item.get("output"));
-                messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
+                // 结果先入缓冲，窗口关闭时按 tool_calls 顺序统一回填
                 pending_calls.remove(pos);
+                results.push((call_id, output));
                 if pending_calls.is_empty() {
-                    // 窗口关闭：先补回被推迟的消息，再开新载体
+                    // 窗口关闭：先回填结果（紧跟 assistant），再补回被推迟的消息
+                    emit_tool_results(&mut messages, open_assistant, &mut results);
                     flush_deferred(&mut messages, &mut deferred);
                     open_assistant = None;
                 }
@@ -233,15 +237,9 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
         }
     }
 
-    // 收尾顺序不可换：先补占位 tool 结果（必须紧跟 assistant.tool_calls），
+    // 收尾顺序不可换：先按 tool_calls 顺序回填结果/占位（必须紧跟 assistant.tool_calls），
     // 再补被推迟的非工具消息（属于批次之后）
-    for call_id in pending_calls.drain(..) {
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": "(tool did not return a result)",
-        }));
-    }
+    emit_tool_results(&mut messages, open_assistant, &mut results);
     flush_deferred(&mut messages, &mut deferred);
     messages
 }
@@ -253,23 +251,50 @@ fn flush_deferred(messages: &mut Vec<Value>, deferred: &mut Vec<(String, String)
     }
 }
 
+/// 窗口关闭/收尾时回填工具结果：按载体 tool_calls 顺序输出（与到达序无关），
+/// 未收到结果的调用补占位——保证 tool 消息连续且逐条对齐 tool_calls
+fn emit_tool_results(
+    messages: &mut Vec<Value>,
+    open_assistant: Option<usize>,
+    results: &mut Vec<(String, String)>,
+) {
+    let Some(i) = open_assistant else { return };
+    let order: Vec<String> = messages[i]
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .map(|tcs| {
+            tcs.iter()
+                .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for call_id in order {
+        let text = results
+            .iter()
+            .find(|(c, _)| c == &call_id)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| "(tool did not return a result)".to_string());
+        messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": text}));
+    }
+    results.clear();
+}
+
 /// 窗口内 assistant 文本并入 tool_calls 载体：content 为字符串则续写，否则直接采用
 fn append_assistant_text(msg: &mut Value, text: &str) {
-    if msg.get("content").map(|c| c.is_string()).unwrap_or(false) {
-        if let Some(Value::String(s)) = msg.get_mut("content") {
+    match msg.get_mut("content") {
+        Some(Value::String(s)) => {
             if !s.is_empty() {
                 s.push_str("\n\n");
             }
             s.push_str(text);
         }
-    } else {
-        msg["content"] = json!(text);
+        _ => msg["content"] = json!(text),
     }
 }
 
-/// tool 输出文本化：字符串直取；数组仅拼接 text 部件，input_image 等非文本部件
-/// 折叠为占位符——旧实现 `to_string()` 会把含 data URL（可达数 MB）的数组整段
-/// JSON 序列化塞进 content，撑爆上游载荷；上游 tool content 为纯字符串，
+/// tool 输出文本化：字符串直取；数组/object 仅拼接 text 部分，input_image 等
+/// 非文本内容折叠为占位符——旧实现 `to_string()` 会把含 data URL（可达数 MB）的
+/// 内容整段 JSON 序列化塞进 content，撑爆上游载荷；上游 tool content 为纯字符串，
 /// 图片本就无法作为多模态透传
 fn tool_output_text(output: Option<&Value>) -> String {
     const NON_TEXT: &str = "[non-text content omitted]";
@@ -292,6 +317,11 @@ fn tool_output_text(output: Option<&Value>) -> String {
             })
             .collect::<Vec<_>>()
             .join(""),
+        Some(Value::Object(o)) => o
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| NON_TEXT.to_string()),
         Some(v) => v.to_string(),
         None => String::new(),
     }
@@ -628,13 +658,59 @@ mod tests {
         });
         let chat = responses_to_chat(&body).unwrap();
         let msgs = chat["messages"].as_array().unwrap();
-        // assistant(tc c1,c2), tool c2, tool c1, user, assistant(tc c3), tool c3
+        // 乱序结果（c2 先到）在窗口关闭时按 tool_calls 顺序重排：
+        // assistant(tc c1,c2), tool c1, tool c2, user, assistant(tc c3), tool c3
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 2);
-        assert_eq!(msgs[1]["tool_call_id"], json!("c2"));
-        assert_eq!(msgs[2]["tool_call_id"], json!("c1"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("c1"));
+        assert_eq!(msgs[1]["content"], json!("r1"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("c2"));
+        assert_eq!(msgs[2]["content"], json!("r2"));
         assert_eq!(msgs[3]["role"], json!("user"));
         assert_eq!(msgs[4]["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(msgs[5]["tool_call_id"], json!("c3"));
+    }
+
+    /// 窗口内 system 消息推迟补回时保留 system 角色，developer 降级 user
+    #[test]
+    fn system_message_inside_tool_window_keeps_role_after_deferral() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+                {"type": "message", "role": "system", "content": "sys note"},
+                {"type": "message", "role": "developer", "content": "dev note"},
+                {"type": "function_call_output", "call_id": "c1", "output": "done"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        // user, assistant(tc c1), tool c1, system, user(dev note)
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("c1"));
+        assert_eq!(msgs[3]["role"], json!("system"));
+        assert_eq!(msgs[3]["content"], json!("sys note"));
+        assert_eq!(msgs[4]["role"], json!("user"));
+        assert_eq!(msgs[4]["content"], json!("dev note"));
+    }
+
+    /// function_call 缺 call_id：call_N 兜底自增，可与显式 call_N 结果配对
+    #[test]
+    fn function_call_without_call_id_falls_back_to_sequential_id() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "name": "a", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "r"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("call_1"));
+        assert_eq!(msgs[1]["content"], json!("r"));
     }
 }
