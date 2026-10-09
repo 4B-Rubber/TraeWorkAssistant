@@ -1564,13 +1564,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 let ttfb_start = std::time::Instant::now();
                 let ttfb_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
-                    Ok(reader) => {
+                    Ok((reader, primary_hdr)) => {
                         // 首字超时 10s（T2.7/F-34）+ F-76③ 慢请求竞速对冲（Trae 池，
                         // wb_route/qoder_route 同构）：首字节超阈值且有其他健康账号时
                         // 向第二账号发对冲请求，先出首字者胜；阈值 0 = 纯首字超时（原语义）。
                         // 双败/首字超时 → 冷却换号；首字节到达后正常流速不受限
                         let mut win = match race_trae_first_byte(
-                            &state, &picked.uid, reader, &tried, trae_allowed.as_ref(),
+                            &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
                         ) {
                             Ok(w) => w,
@@ -1598,7 +1598,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）；
                         // 后续记账/日志/粘性绑定均以生效账号 win_uid 为准
                         guard = settle_trae_hedge(&state, &mut win, guard, &picked.uid);
-                        let TraeRaceWin { lines: win_lines, uid: win_uid, .. } = win;
+                        let TraeRaceWin { lines: win_lines, uid: win_uid, upstream_hdr, .. } = win;
                         // 首行打点包装：首次成功读到上游行即记录 ttfb（0 哨兵防重复
                         // 覆盖；叠加首字超时包装，语义为「请求发起 → 首行到达」）
                         let lines = {
@@ -1662,7 +1662,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     state.logger.log_request_ttfb(
                                         "trae", "POST", proto.log_path(), &model, stream,
                                         200, &win_uid, duration_ms, ttfb_ms, &key_name,
-                                        &state.pool.name_of(&win_uid), Some("空完成（内容已流出）→ 就地收尾"),
+                                        &state.pool.name_of(&win_uid),
+                                        Some(&format!(
+                                            "空完成（内容已流出）→ 就地收尾 [upstream: {}]",
+                                            upstream_hdr
+                                        )),
                                     );
                                     return;
                                 }
@@ -1672,7 +1676,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.logger.log_request_ttfb(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &win_uid, duration_ms, ttfb_ms, &key_name,
-                                    &state.pool.name_of(&win_uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                    &state.pool.name_of(&win_uid),
+                                    Some(&format!(
+                                        "空完成 → 换号重试{} [upstream: {}]",
+                                        super::wb_payload::template_hit_note(),
+                                        upstream_hdr
+                                    )),
                                 );
                                 break; // 退出重试循环 → 换号
                             }
@@ -2040,7 +2049,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             let mut same_attempt: u32 = 0;
             loop {
                 match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
-                    Ok(reader) => {
+                    Ok((reader, primary_hdr)) => {
                         let chat_id = match proto {
                             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
                             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -2069,7 +2078,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     state.logger.log_request(
                                         "trae", "POST", proto.log_path(), &model, stream,
                                         502, &picked.uid, duration_ms, &key_name,
-                                        &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                        &state.pool.name_of(&picked.uid),
+                                        Some(&format!(
+                                            "空完成 → 换号重试{} [upstream: {}]",
+                                            super::wb_payload::template_hit_note(),
+                                            primary_hdr
+                                        )),
                                     );
                                     break; // 换号
                                 }
@@ -2337,13 +2351,15 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 struct TraeHedgeLease {
     uid: String,
     counter: Arc<std::sync::atomic::AtomicU32>,
+    /// 对冲请求的上游响应头摘要（空 = 建连后未捕获）；对冲接管时用于空完成取证
+    upstream_hdr: String,
 }
 
 impl TraeHedgeLease {
     fn acquire(state: &ApiSharedState, uid: &str) -> Self {
         let counter = state.pool.inflight_handle(uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { uid: uid.to_string(), counter }
+        Self { uid: uid.to_string(), counter, upstream_hdr: String::new() }
     }
 }
 
@@ -2362,6 +2378,9 @@ struct TraeRaceWin {
     hedge: Option<TraeHedgeLease>,
     /// 对冲接管（对冲请求先出首字）
     takeover: bool,
+    /// 生效请求的上游响应头摘要：主请求胜出 → 主请求摘要；对冲接管 → 对冲侧
+    /// 摘要（未捕获时降级保留主请求摘要）。空完成日志取证用
+    upstream_hdr: String,
 }
 
 /// 首字竞速（Trae 池，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -2374,6 +2393,7 @@ fn race_trae_first_byte(
     state: &Arc<ApiSharedState>,
     primary_uid: &str,
     reader: Box<dyn Read + Send>,
+    primary_hdr: String,
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
@@ -2391,6 +2411,7 @@ fn race_trae_first_byte(
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            upstream_hdr: primary_hdr,
         });
     }
     let state2 = state.clone();
@@ -2408,7 +2429,7 @@ fn race_trae_first_byte(
             state2.logger.log_sched_event(&ev);
         }
         // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
-        let lease = TraeHedgeLease::acquire(&state2, &picked2.uid);
+        let mut lease = TraeHedgeLease::acquire(&state2, &picked2.uid);
         // 对冲请求体按对冲账号指纹重建
         let converted2 = super::payload::prepare_llm_chat_body(
             &body,
@@ -2420,7 +2441,7 @@ fn race_trae_first_byte(
             sanitize,
             &templates2,
         );
-        let reader2 = make_upstream_request(
+        let (reader2, hdr2) = make_upstream_request(
             &picked2.jwt,
             &picked2.uid,
             &picked2.device_id,
@@ -2428,6 +2449,7 @@ fn race_trae_first_byte(
             &converted2,
         )
         .ok()?;
+        lease.upstream_hdr = hdr2;
         Some((reader2, lease))
     };
     match super::wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
@@ -2440,7 +2462,23 @@ fn race_trae_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(TraeRaceWin { lines: out.lines, uid, hedge: out.hedge, takeover: out.takeover })
+            // 生效侧响应头摘要：主请求胜出 → 主请求摘要；对冲接管 → 对冲侧摘要
+            //（对冲侧未捕获到时降级保留主请求摘要，仍可凭主请求凭据追溯/申诉）
+            let mut upstream_hdr = primary_hdr;
+            if out.takeover {
+                if let Some(l) = out.hedge.as_ref() {
+                    if !l.upstream_hdr.is_empty() {
+                        upstream_hdr = l.upstream_hdr.clone();
+                    }
+                }
+            }
+            Ok(TraeRaceWin {
+                lines: out.lines,
+                uid,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                upstream_hdr,
+            })
         }
         Err(()) => Err(()),
     }
@@ -2488,13 +2526,41 @@ fn read_limited_body(response: ureq::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// 空完成取证（issue #57）：上游 HTTP 200 零内容时，把响应侧可追溯标识
+/// （logid / 网关请求 id / trace 类头）与我方发出的 trace/request-id 拼成一行
+/// 紧凑摘要，追加进空完成日志，为向上游申诉或自查提供凭据。
+/// 仅收录存在的头；值按字符截断到 96 防日志膨胀。
+fn upstream_header_digest(r: &ureq::Response, sent_trace: &str, sent_req_id: &str) -> String {
+    const CANDIDATES: [&str; 7] = [
+        "logid",
+        "x-tt-logid",
+        "x-lgw-request-id",
+        "x-lgw-trace-id",
+        "x-request-id",
+        "x-tt-envflags",
+        "server-timing",
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    for name in CANDIDATES {
+        if let Some(v) = r.header(name) {
+            let v = v.trim();
+            if !v.is_empty() {
+                parts.push(format!("{}={}", name, v.chars().take(96).collect::<String>()));
+            }
+        }
+    }
+    parts.push(format!("sent_trace={}", sent_trace));
+    parts.push(format!("sent_req={}", sent_req_id));
+    parts.join("; ")
+}
+
 fn make_upstream_request(
     jwt: &str,
     _uid: &str,
     device_id: &str,
     machine_id: &str,
     body: &[u8],
-) -> Result<Box<dyn Read + Send>, (u16, String, Option<u64>)> {
+) -> Result<(Box<dyn Read + Send>, String), (u16, String, Option<u64>)> {
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -2538,7 +2604,12 @@ fn make_upstream_request(
         .send_bytes(body);
 
     match resp {
-        Ok(r) => Ok(Box::new(r.into_reader())),
+        Ok(r) => {
+            // 空完成取证：必须在 into_reader 消费响应前捕获响应头（与下方
+            // retry-after 同一约束）；摘要随 reader 一并返回
+            let digest = upstream_header_digest(&r, &trace_id[..16], &request_id);
+            Ok((Box::new(r.into_reader()), digest))
+        }
         Err(ureq::Error::Status(code, response)) => {
             // Retry-After（秒）解析（P1 修复1）：供分级重试表 429 退避决策；
             // header 需在 into_reader 消费响应前读取

@@ -1220,7 +1220,7 @@ mod tests {
             tx,
             "c1",
         );
-        let (code, msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
+        let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
         assert!(!sent_any);
         assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
