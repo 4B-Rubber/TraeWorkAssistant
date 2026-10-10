@@ -99,6 +99,11 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     crate::device_proxy::ca::ensure_ca(&certs_dir)?;
     let cer = certs_dir.join("ca.cer");
     let cer_arg = cer.to_string_lossy().replace('\\', "/").to_string();
+    // PS 单引号字面量转义（' → ''）：用户名含撇号（如 O'Brien，Windows 目录名合法
+    // → USERPROFILE/证书目录含撇号）时未转义会让整条命令语法错误，提权安装恒败
+    // 并白耗一次 UAC 弹窗。仅用于 ps 字符串；certutil 直调走 CreateProcess 参数
+    // 语义，保留原始未转义 cer_arg
+    let cer_arg_ps = cer_arg.replace('\'', "''");
 
     // 2. 管理员权限安装到本地计算机受信任根证书颁发机构（触发 UAC）：
     //    路径加引号防止含空格时被拆参；-PassThru + exit 取 certutil 真实退出码；
@@ -106,7 +111,7 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     //    $p 为 null → exit $null 会误报成功，随后只能靠复查根存储兜底且文案误导）
     let ps = format!(
         "try {{ $p = Start-Process certutil -ArgumentList '-addstore','-f','Root','\"{}\"' -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode }} catch {{ exit 1223 }}",
-        cer_arg
+        cer_arg_ps
     );
     let run_elevated = || -> Result<std::process::ExitStatus, std::io::Error> {
         powershell_command()

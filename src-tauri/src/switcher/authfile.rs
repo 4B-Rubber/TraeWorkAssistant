@@ -440,7 +440,7 @@ fn replace_identity_key(
     }
     if scalar
         && !creds.access_token.is_empty()
-        && matches!(lk.as_str(), "accesstoken" | "access_token" | "token")
+        && matches!(lk.as_str(), "accesstoken" | "access_token")
     {
         set_str(v, &creds.access_token);
         hits.access = true;
@@ -519,6 +519,51 @@ fn rewrite_identity_keys(j: &mut serde_json::Value, creds: &Creds) -> RewriteHit
         }
     }
     walk(j, creds, &mut hits);
+    // 裸键 token 兜底：live auth 文件实测存在裸键 `token` 形态的 access token
+    //（issue #58 诊断，extract_access_token / wb_common::creds_of 的候选键均含
+    // "token"）。主 walk 的 access 匹配集不含裸键（防壳内语义无关的私有 token
+    // 字段被误改写），但壳模板只有裸键时若无此兜底：主 walk 不命中 → 补写块插入
+    // 新 accessToken → 旧裸键 token 残留且过期时间指向新 token，三者共存，最坏
+    // 导致客户端读到旧 token、切换无效。仅当整树未命中任何 access 键且凭证非空时
+    // 二次遍历改写第一个标量 token 键（大小写不敏感）并置 hits.access = true，
+    // 阻止补写块重复插 accessToken；壳内同时存在 accessToken 与私有 token 字段时
+    // 不触发（主 walk 已命中），私有字段零接触——兼顾「私有字段不碰」与「裸键
+    // 身份位必须改写」两个目标
+    if !hits.access && !creds.access_token.is_empty() {
+        fn walk_bare_token(j: &mut serde_json::Value, creds: &Creds, hit: &mut bool) {
+            if *hit {
+                return;
+            }
+            match j {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map.iter_mut() {
+                        let scalar = v.is_string() || v.is_null() || v.is_number();
+                        if k.eq_ignore_ascii_case("token") && scalar {
+                            *v = json!(creds.access_token);
+                            *hit = true;
+                            return;
+                        }
+                        walk_bare_token(v, creds, hit);
+                        if *hit {
+                            return;
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for v in items.iter_mut() {
+                        walk_bare_token(v, creds, hit);
+                        if *hit {
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut bare_hit = false;
+        walk_bare_token(j, creds, &mut bare_hit);
+        hits.access = bare_hit;
+    }
     hits
 }
 
@@ -635,7 +680,8 @@ pub fn synthesize_auth_snapshot(
     if let Err(e) =
         std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
     {
-        // meta 缺失不阻塞合成结果：confirm 期望 uid 回退 slot 名，后续完整备份会重写
+        // meta 缺失不阻塞合成结果：confirm 期望 uid 回退会话暂存 bootstrap_uid
+        //（与 meta 的 uid 同源），后续完整备份会重写 meta
         sink.step("bootstrap", StepStatus::Warn, &format!("meta.json 写入失败: {e}"));
     }
     sink.step(
@@ -644,6 +690,21 @@ pub fn synthesize_auth_snapshot(
         &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
     );
     Some(creds.uid.clone())
+}
+
+/// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。
+/// 完整快照升级门控 `sess.bootstrap_done` 仅当次 run_action 会话有效；合成后切换
+/// 未走完（进程退出 / 切换失败重试）时，下次会话切到同槽（槽位已存在，不再合成）
+/// 成功确认也要能触发升级——以槽位持久化标记补判。backup_authfile 重写 meta 时
+/// 不带该键，升级后标记自然清除。
+pub fn slot_marked_bootstrap(sess: &Session, slot: &str) -> bool {
+    std::fs::read_to_string(sess.prof.profiles_dir.join(slot).join("meta.json"))
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|m| m.get("bootstrap").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
 }
 
 /// 切换确认结果（PS 返回 'ok'/'timeout'）
@@ -675,11 +736,16 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let auth_file = &sess.auth_file;
     let snap_file = sess.prof.data_dir.join("storage").join("skeleton").join("account-snapshot.json");
     let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");
-    // 期望 uid：meta.json 优先，缺失回退 slot 名
+    // 期望 uid 回退链：meta.json → 会话暂存 bootstrap_uid（合成快照真实 uid，与
+    // meta 同源；meta.json 写失败不阻塞合成时的回退依据）→ slot 名（wb-<hash>
+    // 池 id ≠ uuid 体系真实 uid，仅作最后兜底——回退到它会让三信号确认恒不命中）
     let mut expect_uid: Option<String> = std::fs::read_to_string(&meta_file)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
         .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    if expect_uid.is_none() {
+        expect_uid = sess.bootstrap_uid.clone();
+    }
     if expect_uid.is_none() {
         expect_uid = Some(slot.to_string());
     }
