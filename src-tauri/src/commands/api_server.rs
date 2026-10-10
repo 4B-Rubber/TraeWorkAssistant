@@ -1738,6 +1738,31 @@ mod pool_merge_tests {
     }
 
     #[test]
+    fn merge_expires_end_to_end_after_persistence_roundtrip() {
+        // issue #75 验收链路：刷新任务写 general_expire_times → 持久化 →
+        // 重启后 load 恢复 → merge 命中调度口径（Work 包混合口径不泄漏）。
+        // 持久化层断链回归测试：save/load 列名或字段不一致时此处必失败。
+        let dir = std::env::temp_dir().join(format!("twa_merge_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let s = crate::store::db(&dir);
+            let mut rc = RemainingCreditsFile::default();
+            rc.general.insert("u1".into(), 90.0);
+            rc.expire_times.insert("u1".into(), 1000);
+            rc.general_expire_times.insert("u1".into(), 2000);
+            crate::store::docs::remaining_credits_save(&s, &rc).unwrap();
+        }
+        let got = {
+            let s = crate::store::db(&dir);
+            let rc = crate::store::docs::remaining_credits_load(&s);
+            merge_pool_expire_times(&rc)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.get("u1"), Some(&2000));
+    }
+
+    #[test]
     fn explicit_wb_uids_override() {
         // Buddy 页勾选保存：显式传 wb_uids → 覆盖（不再走旧数据迁移）
         let mut legacy = existing();
