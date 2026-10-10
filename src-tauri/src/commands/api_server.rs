@@ -95,6 +95,25 @@ pub async fn do_start(
     };
     // 诊断口径与池装配一致：通用积分余额/到期（老缓存账号回退混合口径）
     let merged_expires = merge_pool_expire_times(&credits_file);
+    // 同 uid 重复条目告警：服务端同 uid 即同一账号，池装配与凭证更新仅按 uid 单条生效，
+    // 多条目会加剧「多账号」错觉（issue #80）；建议保留一条、删除多余
+    let mut seen_uids: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for a in &accounts.accounts {
+        if let Some(uid) = a.user_id.as_deref() {
+            match seen_uids.get(uid) {
+                Some(first_name) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "  账号池告警: 发现重复 uid={}（已有账号 [{}]，当前账号 [{}]）；池装配与凭证更新仅按 uid 单条生效，建议保留一条、删除多余条目",
+                        uid, first_name, a.name
+                    ),
+                ),
+                None => {
+                    seen_uids.insert(uid, a.name.as_str());
+                }
+            }
+        }
+    }
     for a in &accounts.accounts {
         let uid = a.user_id.as_deref().unwrap_or("(none)");
         let name = &a.name;

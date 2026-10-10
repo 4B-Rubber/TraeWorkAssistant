@@ -116,6 +116,10 @@ pub struct OAuthLoginResult {
     pub jwt: String,
     pub refresh_token: String,
     pub has_refresh_token: bool,
+    /// 本次登录是否与已有账号同 uid（合并更新而非新增）
+    pub merged: bool,
+    /// 合并时被更新的已有账号名（merged=false 时为 None）
+    pub existing_name: Option<String>,
 }
 
 /// 短请求 Agent（项目未启用 ureq 的 proxy-from-env feature，Agent 默认直连）
@@ -1413,13 +1417,14 @@ pub fn oauth_login(
     let final_refresh_token = new_refresh_token
         .unwrap_or_else(|| callback_info.refresh_token.clone());
 
-    // 7. 检查账号是否已存在
+    // 7. 检查账号是否已存在（同 uid 视为同一服务端账号，合并更新而非新增）
     let mut accounts = crate::vault::load_accounts(&state);
-    if accounts
+    let merged_existing_name = accounts
         .accounts
         .iter()
-        .any(|a| a.user_id.as_deref() == Some(&user_id))
-    {
+        .position(|a| a.user_id.as_deref() == Some(&user_id))
+        .map(|idx| accounts.accounts[idx].name.clone());
+    if let Some(existing_name) = merged_existing_name.clone() {
         // 已存在：更新 JWT 和 refresh_token
         let acct = accounts
             .accounts
@@ -1432,12 +1437,25 @@ pub fn oauth_login(
         // 重新 OAuth 登录拿到新 token：生命周期计数清零、失效标记解除（F-78 批次 3）
         acct.refresh_token_fails = 0;
         acct.refresh_token_invalid = false;
+        // 合并路径同属「OAuth 登录成功更新凭证」，auth_saved_at 与新账号/刷新成功路径对齐刷新
+        acct.auth_saved_at = Some(fs_utils::now_iso());
         crate::vault::save_accounts(&state, &mut accounts)?;
 
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("OAuth 登录：更新已有账号 [{}] jwt + refresh_token", name),
-        );
+        // 日志必须指向实际被更新的账号名（existing_name），而非本次登录输入的新名，
+        // 避免同名不同手机号场景下被误读为「覆盖/串号」（issue #80）
+        if existing_name == name {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("OAuth 登录：更新已有账号 [{existing_name}] jwt + refresh_token"),
+            );
+        } else {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "OAuth 登录：uid={user_id} 与已有账号 [{existing_name}] 相同，本次登录名 [{name}] 视为同一服务端账号，已更新 [{existing_name}] 的 jwt + refresh_token（未新增账号）"
+                ),
+            );
+        }
     } else {
         // 新账号
         accounts.accounts.push(RawAccount {
@@ -1456,18 +1474,19 @@ pub fn oauth_login(
         });
         crate::vault::save_accounts(&state, &mut accounts)?;
 
-        // 设置分组
-        if let Some(g) = group_id {
-            let mut groups: crate::models::GroupsFile =
-                crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-            groups.membership.insert(user_id.clone(), g);
-            crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-        }
-
         fs_utils::app_log(
             &state.data_dir,
             &format!("OAuth 登录：新增账号 [{}] user_id={}", name, user_id),
         );
+    }
+
+    // 所选分组统一在账号落库后应用（新增/合并路径对齐）：用户在登录界面明确选择分组时
+    // 同步写入 membership（合并路径此前静默丢弃所选分组）；未选分组时保持原分组不变。
+    if let Some(g) = group_id {
+        let mut groups: crate::models::GroupsFile =
+            crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+        groups.membership.insert(user_id.clone(), g);
+        crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
     }
 
     // 重新登录拿到新凭证 → 运行中 API 池热重载（全量重建，覆盖单点回填管不到的
@@ -1480,6 +1499,8 @@ pub fn oauth_login(
         jwt,
         refresh_token: final_refresh_token,
         has_refresh_token: true,
+        merged: merged_existing_name.is_some(),
+        existing_name: merged_existing_name,
     })
 }
 
